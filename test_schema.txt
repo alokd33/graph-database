@@ -503,3 +503,53 @@ Notes
 In Cypher, I used the node properties we set in your import mapping (Trim.trimId, VehicleModel.code, SaleRecord.qty, SaleRecord.date, etc.).
 
 If you went with the relationship-based sales alternative ((:Trim)-[:SOLD_IN {date, qty}]->(:Region)), I can provide parallel Cypher for that flavor too.
+
+
+
+                    ┌─────────────────────────────────────────────────┐
+   (1) Sales DB  ─────▶│ Ingestion (Airbyte/NiFi/Kafka Connect)          │
+   (2) R&D PDFs  ─────▶│ - Batch: S3 drop / connectors                   │
+   (3) Scanned PDFs ──▶│ - Stream: Twitter API / reviews feed            │
+   (4) Images/Design ─▶│ - Media: S3, captions via CV                    │
+   (5) XML/JSON   ────▶│ - Patent dumps (bulk)                           │
+   (6) Reviews/Twitter▶│ - Schema mapping to canonical tables (Silver)   │
+   (7) Features/Parts ─▶│ - Entity resolution & IDs                      │
+   (8) Patents/General▶│ - DQ checks & lineage                           │
+                       └───────────────┬─────────────────────────────────┘
+                                       │   (Parquet + Delta/Iceberg)
+                                 ┌─────▼─────────────────────┐
+                                 │   Lakehouse (Gold Zone)   │
+                                 │   Conformed domain tables │
+                                 └─────┬───────────┬─────────┘
+                                       │           │
+                          ┌────────────▼─┐     ┌───▼────────────────┐
+                          │  Ontology    │     │  Text/Media Index   │
+                          │  (OWL +      │     │  (Vector store +    │
+                          │  SHACL)      │     │   BM25; embeddings) │
+                          └──────┬───────┘     └─────────┬───────────┘
+                                 │                       │
+                          ┌──────▼─────────┐     ┌───────▼───────────┐
+                          │ KG Builder     │     │ CV/NLP Processing │
+                          │ (R2RML/mappers │     │ - OCR (PDFs)      │
+                          │  + ETL)        │     │ - NER/EL           │
+                          └──────┬─────────┘     │ - Image tags, CLIP │
+                                 │               └──────────┬─────────┘
+                       ┌─────────▼──────────┐               │
+                       │ Knowledge Graph    │               │
+                       │ (RDF store/SPARQL  │               │
+                       │  or Property Graph │               │
+                       │  with Cypher)      │               │
+                       └─────────┬──────────┘               │
+                                 │                          │
+                     ┌───────────▼──────────────────────────▼──────────┐
+                     │                Q&A Orchestrator                  │
+                     │ - Query Router (KG vs RAG vs Hybrid)             │
+                     │ - SPARQL/Cypher executor                         │
+                     │ - Retriever (dense + BM25) + re-ranker           │
+                     │ - LLM answer composer with citations             │
+                     └───────────┬──────────────────────────────────────┘
+                                 │
+                          ┌──────▼─────────┐
+                          │  API/UI (Chat) │
+                          │  + dashboards  │
+                          └────────────────┘
