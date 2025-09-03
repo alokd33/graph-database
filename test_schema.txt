@@ -1,0 +1,505 @@
+Option 1: Drop only the data (keep DB and indexes)
+
+This wipes out all nodes/relationships but leaves the database, indexes, and constraints intact.
+
+// delete everything
+MATCH (n) DETACH DELETE n;
+
+This will remove all nodes and relationships, but constraints and indexes remain.
+Afterward, you can re-run your CREATE CONSTRAINT and UNWIND … MERGE scripts to rebuild the data.
+
+Option 2: Drop constraints & indexes (start from scratch)
+
+If you want a clean slate (no schema at all):
+
+// drop all constraints
+CALL apoc.schema.assert({}, {}, true);
+
+// OR manually:
+SHOW CONSTRAINTS;
+DROP CONSTRAINT <name>;
+SHOW INDEXES;
+DROP INDEX <name>;
+
+DROP CONSTRAINT vehicle_model_code IF EXISTS;
+DROP CONSTRAINT trim_code          IF EXISTS;
+DROP CONSTRAINT feature_code       IF EXISTS;
+DROP CONSTRAINT region_code        IF EXISTS;
+DROP CONSTRAINT sale_id            IF EXISTS;
+
+
+
+
+
+🔹 Option 3: Drop & recreate the entire database (hard reset)
+
+If you’re in Neo4j Desktop / local installation:
+
+// Drop the existing database (e.g., 'neo4j')
+DROP DATABASE neo4j;
+
+// Recreate a fresh empty one
+CREATE DATABASE neo4j;
+
+// Switch to it
+:use neo4j;
+
+
+ You need admin privileges (in system database). This will wipe absolutely everything in that DB (data, indexes, constraints).
+
+
+-- CREATE CONSTRAINT vehicle_model_code IF NOT EXISTS FOR (n:VehicleModel) REQUIRE n.code IS UNIQUE;
+-- CREATE CONSTRAINT trim_code          IF NOT EXISTS FOR (n:Trim)         REQUIRE n.code IS UNIQUE;
+-- CREATE CONSTRAINT feature_code       IF NOT EXISTS FOR (n:Feature)      REQUIRE n.code IS UNIQUE;
+-- CREATE CONSTRAINT region_code        IF NOT EXISTS FOR (n:Region)       REQUIRE n.code IS UNIQUE;
+-- CREATE CONSTRAINT sale_id            IF NOT EXISTS FOR (n:SaleRecord)   REQUIRE n.id   IS UNIQUE;
+
+
+
+1) Constraints & indexes (id/lookup hygiene)
+// --- Uniqueness on business keys
+CREATE CONSTRAINT vehicle_model_id IF NOT EXISTS
+FOR (m:VehicleModel) REQUIRE m.modelId IS UNIQUE;
+
+CREATE CONSTRAINT trim_id IF NOT EXISTS
+FOR (t:Trim) REQUIRE t.trimId IS UNIQUE;
+
+CREATE CONSTRAINT feature_id IF NOT EXISTS
+FOR (f:Feature) REQUIRE f.featureId IS UNIQUE;
+
+CREATE CONSTRAINT region_code IF NOT EXISTS
+FOR (r:Region) REQUIRE r.code IS UNIQUE;
+
+CREATE CONSTRAINT sale_id IF NOT EXISTS
+FOR (s:SaleRecord) REQUIRE s.saleId IS UNIQUE;
+
+// Optional lookups
+CREATE INDEX vehicle_model_code IF NOT EXISTS FOR (m:VehicleModel) ON (m.code);
+CREATE INDEX feature_code IF NOT EXISTS FOR (f:Feature) ON (f.code);
+
+
+2) Seed nodes (vehicle_model, trim, feature, region, sale_record)
+vehicle_model
+UNWIND [
+  {modelId:'CRV1', code:'CRV', name:'Honda CR-V'},
+  {modelId:'ACC1', code:'ACC', name:'Honda Accord'}
+] AS row
+MERGE (m:VehicleModel {modelId: row.modelId})
+SET m.code = row.code,
+    m.name = row.name;
+
+trim
+UNWIND [
+  {trimId:'T201', modelId:'CRV1', year:2024},
+  {trimId:'T202', modelId:'ACC1', year:2024}
+] AS row
+MERGE (t:Trim {trimId: row.trimId})
+SET t.year = row.year
+WITH t, row
+MATCH (m:VehicleModel {modelId: row.modelId})
+MERGE (t)-[:OF_MODEL]->(m);
+
+feature
+UNWIND [
+  {featureId:'F11', code:'SENS', name:'Honda Sensing'},
+  {featureId:'F12', code:'HUD',  name:'Head-Up Display'}
+] AS row
+MERGE (f:Feature {featureId: row.featureId})
+SET f.code = row.code,
+    f.name = row.name;
+
+trim_feature (relationships)
+UNWIND [
+  {trimId:'T201', featureId:'F11'},
+  {trimId:'T202', featureId:'F12'}
+] AS row
+MATCH (t:Trim {trimId: row.trimId})
+MATCH (f:Feature {featureId: row.featureId})
+MERGE (t)-[:HAS_FEATURE]->(f);
+
+region
+UNWIND [
+  {code:'CA', name:'California'},
+  {code:'TX', name:'Texas'}
+] AS row
+MERGE (r:Region {code: row.code})
+SET r.name = row.name;
+
+sale_record
+
+(we keep sales as their own nodes so you can hang facts like channel, dealer, price, etc. later; each sale connects to its Trim and Region)
+
+UNWIND [
+  {saleId:'S101', trimId:'T201', region:'CA', date:'2024-05-10', qty:350},
+  {saleId:'S102', trimId:'T202', region:'TX', date:'2024-06-12', qty:220}
+] AS row
+MERGE (s:SaleRecord {saleId: row.saleId})
+SET s.date = date(row.date),
+    s.qty  = toInteger(row.qty)
+WITH s, row
+MATCH (t:Trim {trimId: row.trimId})
+MATCH (r:Region {code: row.region})
+MERGE (s)-[:FOR_TRIM]->(t)
+MERGE (s)-[:IN_REGION]->(r);
+
+
+----// Models and their trims
+MATCH (m:VehicleModel)<-[:OF_MODEL]-(t:Trim)
+RETURN m.code AS model, t.trimId AS trim, t.year AS year
+ORDER BY model, trim;
+
+
+model	trim	year
+ACC	T202	2024
+CRV	T201	2024
+
+
+
+
+// Features by trim
+MATCH (t:Trim)-[:HAS_FEATURE]->(f:Feature)
+RETURN t.trimId AS trim, f.code AS feature, f.name AS featureName
+ORDER BY trim;
+
+trim	feature	featureName
+T201	SENS	Honda Sensing
+T202	HUD	Head-Up Display
+
+// Sales by trim & region
+MATCH (s:SaleRecord)-[:FOR_TRIM]->(t:Trim)-[:OF_MODEL]->(m:VehicleModel),
+      (s)-[:IN_REGION]->(r:Region)
+RETURN s.saleId, m.code AS model, t.trimId AS trim, r.code AS region, s.date, s.qty
+ORDER BY s.date;
+
+s.saleId	model	trim	region	s.date	s.qty
+S101	CRV	T201	CA	5/10/24	350
+S102	ACC	T202	TX	6/12/24	220
+
+
+
+Optional: represent sales as relationship properties (alternative)
+
+If you’d rather avoid SaleRecord nodes, you can store facts as properties on a relationship between Trim and Region (useful when you have one row per (trim,region,date) and you don’t need to hang more attributes later):
+
+UNWIND [
+  {trimId:'T201', region:'CA', date:'2024-05-10', qty:350},
+  {trimId:'T202', region:'TX', date:'2024-06-12', qty:220}
+] AS row
+MATCH (t:Trim {trimId: row.trimId})
+MATCH (r:Region {code: row.region})
+MERGE (t)-[sr:SOLD_IN {date: date(row.date)}]->(r)
+SET sr.qty = toInteger(row.qty);
+
+
+Pick SaleRecord nodes if you’ll add more fields (dealer, channel, incentives) or need to reference each sale from multiple dimensions. Use relationship properties for lighter analytics on a time series.
+
+If you want, I can also generate CSV files + LOAD CSV commands for this same dataset, or fold these imports into your existing Spark/DBT jobs.
+
+
+
+Great idea—here’s a clean RDBMS schema (DDL) for your dataset, plus inserts for your two sample rows per table. I’ve also added a short mapping to the Neo4j schema so you can compare 1:1.
+
+1) Relational schema (DDL)
+-- =========================
+-- Core reference tables
+-- =========================
+CREATE TABLE vehicle_model (
+  model_id    VARCHAR(16)  PRIMARY KEY,              -- e.g., 'CRV1'
+  code        VARCHAR(16)  NOT NULL UNIQUE,          -- e.g., 'CRV'
+  name        VARCHAR(128) NOT NULL                  -- e.g., 'Honda CR-V'
+);
+
+CREATE TABLE trim (
+  trim_id     VARCHAR(16)  PRIMARY KEY,              -- e.g., 'T201'
+  model_id    VARCHAR(16)  NOT NULL REFERENCES vehicle_model(model_id),
+  model_year  INT          NOT NULL,
+  CONSTRAINT chk_trim_year CHECK (model_year BETWEEN 1900 AND 2100),
+  CONSTRAINT uq_trim UNIQUE (model_id, model_year)   -- optional, but typical
+);
+
+CREATE TABLE feature (
+  feature_id  VARCHAR(16)  PRIMARY KEY,              -- e.g., 'F11'
+  code        VARCHAR(32)  NOT NULL UNIQUE,          -- e.g., 'SENS'
+  name        VARCHAR(128) NOT NULL                  -- e.g., 'Honda Sensing'
+);
+
+-- Junction (many-to-many Trim ↔ Feature)
+CREATE TABLE trim_feature (
+  trim_id     VARCHAR(16)  NOT NULL REFERENCES trim(trim_id),
+  feature_id  VARCHAR(16)  NOT NULL REFERENCES feature(feature_id),
+  PRIMARY KEY (trim_id, feature_id)
+);
+
+CREATE TABLE region (
+  region_code VARCHAR(8)   PRIMARY KEY,              -- e.g., 'CA'
+  name        VARCHAR(64)  NOT NULL                  -- e.g., 'California'
+);
+
+-- Fact table: sales by trim/region/date
+CREATE TABLE sale_record (
+  sale_id     VARCHAR(16)  PRIMARY KEY,              -- e.g., 'S101'
+  trim_id     VARCHAR(16)  NOT NULL REFERENCES trim(trim_id),
+  region_code VARCHAR(8)   NOT NULL REFERENCES region(region_code),
+  sale_date   DATE         NOT NULL,                 -- e.g., 2024-05-10
+  quantity    INT          NOT NULL,
+  CONSTRAINT chk_quantity_nonneg CHECK (quantity >= 0)
+);
+
+-- Helpful indexes for joins & filters
+CREATE INDEX ix_trim_model ON trim(model_id);
+CREATE INDEX ix_trimfeature_feature ON trim_feature(feature_id);
+CREATE INDEX ix_sale_trim ON sale_record(trim_id);
+CREATE INDEX ix_sale_region ON sale_record(region_code);
+CREATE INDEX ix_sale_date ON sale_record(sale_date);
+
+Seed data (your two rows per table)
+-- vehicle_model
+INSERT INTO vehicle_model (model_id, code, name) VALUES
+('CRV1','CRV','Honda CR-V'),
+('ACC1','ACC','Honda Accord');
+
+-- trim
+INSERT INTO trim (trim_id, model_id, model_year) VALUES
+('T201','CRV1',2024),
+('T202','ACC1',2024);
+
+-- feature
+INSERT INTO feature (feature_id, code, name) VALUES
+('F11','SENS','Honda Sensing'),
+('F12','HUD','Head-Up Display');
+
+-- trim_feature
+INSERT INTO trim_feature (trim_id, feature_id) VALUES
+('T201','F11'),
+('T202','F12');
+
+-- region
+INSERT INTO region (region_code, name) VALUES
+('CA','California'),
+('TX','Texas');
+
+-- sale_record
+INSERT INTO sale_record (sale_id, trim_id, region_code, sale_date, quantity) VALUES
+('S101','T201','CA','2024-05-10',350),
+('S102','T202','TX','2024-06-12',220);
+
+2) How this maps to a Neo4j property-graph model
+RDBMS Table	Neo4j Node / Relationship	Identity (Neo4j)	Key Relationship(s)
+vehicle_model	Node (:VehicleModel)	modelId, code	← (:Trim)-[:OF_MODEL]->(:VehicleModel)
+trim	Node (:Trim)	trimId	(:Trim)-[:OF_MODEL]->(:VehicleModel)
+feature	Node (:Feature)	featureId, code	(:Trim)-[:HAS_FEATURE]->(:Feature)
+trim_feature	Relationship (:Trim)-[:HAS_FEATURE]->(:Feature)	N/A (rel type + endpoints)	Derived from PK (trim_id, feature_id)
+region	Node (:Region)	code	(:SaleRecord)-[:IN_REGION]->(:Region)
+sale_record	Node (:SaleRecord) or Rel props (alt)	saleId	(:SaleRecord)-[:FOR_TRIM]->(:Trim) and (:SaleRecord)-[:IN_REGION]->(:Region)
+Recommended Neo4j constraints (parallels to RDBMS PK/unique)
+CREATE CONSTRAINT vehicle_model_id IF NOT EXISTS
+FOR (m:VehicleModel) REQUIRE m.modelId IS UNIQUE;
+
+CREATE CONSTRAINT trim_id IF NOT EXISTS
+FOR (t:Trim) REQUIRE t.trimId IS UNIQUE;
+
+CREATE CONSTRAINT feature_id IF NOT EXISTS
+FOR (f:Feature) REQUIRE f.featureId IS UNIQUE;
+
+CREATE CONSTRAINT region_code IF NOT EXISTS
+FOR (r:Region) REQUIRE r.code IS UNIQUE;
+
+CREATE CONSTRAINT sale_id IF NOT EXISTS
+FOR (s:SaleRecord) REQUIRE s.saleId IS UNIQUE;
+
+Core relationships in Neo4j
+
+(:Trim)-[:OF_MODEL]->(:VehicleModel)
+
+(:Trim)-[:HAS_FEATURE]->(:Feature)
+
+(:SaleRecord)-[:FOR_TRIM]->(:Trim)
+
+(:SaleRecord)-[:IN_REGION]->(:Region)
+
+Alternative to SaleRecord nodes: represent sales as (:Trim)-[:SOLD_IN {date, qty}]->(:Region).
+Keep SaleRecord as a node if you expect to attach more facts later (dealer, channel, incentives) or reference each sale from multiple dimensions.
+
+Quick ER-style overview (RDBMS)
+
+vehicle_model (1) —< trim (N)
+
+trim (N) —< trim_feature (N) >— feature (N)
+
+trim (1) —< sale_record (N) >— region (1)
+
+This RDBMS design mirrors the Neo4j model you’re using, making it easy to reason about joins vs. traversals. If you want, I can also generate:
+
+a LOAD CSV package for Neo4j with these rows, or
+
+a Spark job that reads these tables and writes nodes/relationships to Neo4j with idempotent MERGEs.
+
+
+1) Models with their trims
+
+Output columns: model, trim, year
+Expected rows:
+CRV | T201 | 2024
+ACC | T202 | 2024
+
+SQL
+
+SELECT m.code AS model, t.trim_id AS trim, t.model_year AS year
+FROM trim t
+JOIN vehicle_model m ON m.model_id = t.model_id
+ORDER BY model, trim;
+
+
+Cypher
+
+MATCH (t:Trim)-[:OF_MODEL]->(m:VehicleModel)
+RETURN m.code AS model, t.trimId AS trim, t.year AS year
+ORDER BY model, trim;
+
+2) Features by trim
+
+Output columns: trim, feature, featureName
+Expected rows:
+T201 | SENS | Honda Sensing
+T202 | HUD | Head-Up Display
+
+SQL
+
+SELECT tf.trim_id AS trim, f.code AS feature, f.name AS featureName
+FROM trim_feature tf
+JOIN feature f ON f.feature_id = tf.feature_id
+ORDER BY trim;
+
+
+Cypher
+
+MATCH (t:Trim)-[:HAS_FEATURE]->(f:Feature)
+RETURN t.trimId AS trim, f.code AS feature, f.name AS featureName
+ORDER BY trim;
+
+3) Sales by trim, with model and region
+
+Output columns: saleId, model, trim, region, date, qty
+Expected rows:
+S101 | CRV | T201 | CA | 2024-05-10 | 350
+S102 | ACC | T202 | TX | 2024-06-12 | 220
+
+SQL
+
+SELECT s.sale_id AS saleId,
+       m.code AS model,
+       t.trim_id AS trim,
+       r.region_code AS region,
+       s.sale_date AS date,
+       s.quantity AS qty
+FROM sale_record s
+JOIN trim t        ON t.trim_id = s.trim_id
+JOIN vehicle_model m ON m.model_id = t.model_id
+JOIN region r      ON r.region_code = s.region_code
+ORDER BY s.sale_date;
+
+
+Cypher
+
+MATCH (s:SaleRecord)-[:FOR_TRIM]->(t:Trim)-[:OF_MODEL]->(m:VehicleModel),
+      (s)-[:IN_REGION]->(r:Region)
+RETURN s.saleId AS saleId,
+       m.code AS model,
+       t.trimId AS trim,
+       r.code AS region,
+       s.date   AS date,
+       s.qty    AS qty
+ORDER BY date;
+
+4) Total sales quantity by region
+
+Output columns: region, totalQty
+Expected rows:
+CA | 350
+TX | 220
+
+SQL
+
+SELECT r.region_code AS region, SUM(s.quantity) AS totalQty
+FROM sale_record s
+JOIN region r ON r.region_code = s.region_code
+GROUP BY r.region_code
+ORDER BY region;
+
+
+Cypher
+
+MATCH (s:SaleRecord)-[:IN_REGION]->(r:Region)
+RETURN r.code AS region, SUM(s.qty) AS totalQty
+ORDER BY region;
+
+5) Total sales quantity by model
+
+Output columns: model, totalQty
+Expected rows:
+CRV | 350
+ACC | 220
+
+SQL
+
+SELECT m.code AS model, SUM(s.quantity) AS totalQty
+FROM sale_record s
+JOIN trim t        ON t.trim_id = s.trim_id
+JOIN vehicle_model m ON m.model_id = t.model_id
+GROUP BY m.code
+ORDER BY model;
+
+
+Cypher
+
+MATCH (s:SaleRecord)-[:FOR_TRIM]->(t:Trim)-[:OF_MODEL]->(m:VehicleModel)
+RETURN m.code AS model, SUM(s.qty) AS totalQty
+ORDER BY model;
+
+6) Trims that include feature “Honda Sensing”
+
+Output columns: trim
+Expected rows:
+T201
+
+SQL
+
+SELECT tf.trim_id AS trim
+FROM trim_feature tf
+JOIN feature f ON f.feature_id = tf.feature_id
+WHERE f.code = 'SENS'
+ORDER BY trim;
+
+
+Cypher
+
+MATCH (t:Trim)-[:HAS_FEATURE]->(f:Feature {code:'SENS'})
+RETURN t.trimId AS trim
+ORDER BY trim;
+
+7) Sales on/after 2024-06-01 (filtering & date)
+
+Output columns: saleId, trim, date, qty
+Expected rows:
+S102 | T202 | 2024-06-12 | 220
+
+SQL
+
+SELECT sale_id AS saleId, trim_id AS trim, sale_date AS date, quantity AS qty
+FROM sale_record
+WHERE sale_date >= DATE '2024-06-01'
+ORDER BY sale_date;
+
+
+Cypher
+
+MATCH (s:SaleRecord)
+WHERE s.date >= date('2024-06-01')
+RETURN s.saleId AS saleId, s.trimId AS trim, s.date AS date, s.qty AS qty
+ORDER BY date;
+
+Notes
+
+In Cypher, I used the node properties we set in your import mapping (Trim.trimId, VehicleModel.code, SaleRecord.qty, SaleRecord.date, etc.).
+
+If you went with the relationship-based sales alternative ((:Trim)-[:SOLD_IN {date, qty}]->(:Region)), I can provide parallel Cypher for that flavor too.
